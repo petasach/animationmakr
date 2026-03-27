@@ -106,9 +106,10 @@ const durationText = document.getElementById("duration");
 const status = document.getElementById("status");
 const trash = document.getElementById("trash");
 
+const MAX_SIZE = 800; // 🔥 key optimization
+
 upload.addEventListener("change", (e) => {
     const files = Array.from(e.target.files);
-
     files.sort((a, b) => a.name.localeCompare(b.name));
 
     images = [];
@@ -126,7 +127,7 @@ upload.addEventListener("change", (e) => {
     updateDuration();
 });
 
-// SORTABLE (drag reorder)
+// drag sorting
 new Sortable(preview, {
     animation: 150,
     onEnd: () => {
@@ -135,7 +136,6 @@ new Sortable(preview, {
     }
 });
 
-// FPS
 fpsInput.addEventListener("input", updateDuration);
 
 function updateDuration() {
@@ -144,9 +144,9 @@ function updateDuration() {
     durationText.textContent = ` | Duration: ${duration.toFixed(2)}s`;
 }
 
-// 🗑️ CLICK → DELETE ALL
+// 🗑️ clear all
 trash.addEventListener("click", () => {
-    if (images.length === 0) return;
+    if (!images.length) return;
 
     if (confirm("Delete all images?")) {
         preview.innerHTML = "";
@@ -155,19 +155,16 @@ trash.addEventListener("click", () => {
     }
 });
 
-// 🗑️ DRAG TO DELETE
+// drag delete
 preview.addEventListener("dragstart", (e) => {
     if (e.target.classList.contains("thumb")) {
-        e.dataTransfer.setData("text/plain", "image");
         e.target.classList.add("dragging");
     }
 });
 
 preview.addEventListener("dragend", (e) => {
-    if (e.target.classList.contains("thumb")) {
-        e.target.classList.remove("dragging");
-        trash.classList.remove("active");
-    }
+    e.target.classList.remove("dragging");
+    trash.classList.remove("active");
 });
 
 trash.addEventListener("dragover", (e) => {
@@ -192,8 +189,29 @@ trash.addEventListener("drop", (e) => {
     trash.classList.remove("active");
 });
 
-// EXPORT
-document.getElementById("export").addEventListener("click", () => {
+// 🔥 RESIZE FUNCTION (CRITICAL FIX)
+function drawToCanvas(img) {
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+
+    let w = img.naturalWidth;
+    let h = img.naturalHeight;
+
+    if (w > MAX_SIZE || h > MAX_SIZE) {
+        const scale = Math.min(MAX_SIZE / w, MAX_SIZE / h);
+        w *= scale;
+        h *= scale;
+    }
+
+    canvas.width = w;
+    canvas.height = h;
+
+    ctx.drawImage(img, 0, 0, w, h);
+    return canvas;
+}
+
+// 🚀 EXPORT (FIXED)
+document.getElementById("export").addEventListener("click", async () => {
     if (images.length === 0) {
         alert("Upload images first");
         return;
@@ -202,31 +220,43 @@ document.getElementById("export").addEventListener("click", () => {
     const fps = parseFloat(fpsInput.value) || 1;
     const delay = 1000 / fps;
 
-    status.textContent = "Rendering GIF...";
+    status.textContent = "Preparing images...";
 
     const gif = new GIF({
         workers: 2,
-        quality: 10
+        quality: 10,
+        workerScript: "https://cdn.jsdelivr.net/npm/gif.js.optimized/dist/gif.worker.js"
     });
 
-    let loaded = 0;
+    let processed = 0;
 
-    images.forEach(img => {
-        const temp = new Image();
-        temp.src = img.src;
+    for (let i = 0; i < images.length; i++) {
+        const img = images[i];
 
-        temp.onload = () => {
-            gif.addFrame(temp, { delay });
+        await new Promise(resolve => {
+            const temp = new Image();
+            temp.src = img.src;
 
-            loaded++;
-            if (loaded === images.length) {
-                gif.render();
-            }
-        };
+            temp.onload = () => {
+                const canvas = drawToCanvas(temp);
+                gif.addFrame(canvas, { delay });
+
+                processed++;
+                status.textContent = `Processing ${processed}/${images.length}`;
+                resolve();
+            };
+        });
+    }
+
+    status.textContent = "Rendering GIF...";
+
+    gif.on("progress", p => {
+        status.textContent = `Rendering: ${Math.round(p * 100)}%`;
     });
 
     gif.on("finished", blob => {
         const url = URL.createObjectURL(blob);
+
         const a = document.createElement("a");
         a.href = url;
         a.download = "output.gif";
@@ -234,6 +264,8 @@ document.getElementById("export").addEventListener("click", () => {
 
         status.textContent = "Done!";
     });
+
+    gif.render();
 });
 </script>
 

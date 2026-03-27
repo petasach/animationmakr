@@ -7,6 +7,7 @@
 
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/gif.js.optimized/dist/gif.js"></script>
+    <script src="https://unpkg.com/mp4-muxer/build/mp4-muxer.js"></script>
 
     <style>
         body {
@@ -195,6 +196,7 @@
         });
 
         // EXPORT
+        // --- 1. MAXIMUM QUALITY GIF EXPORT ---
         document.getElementById("export").addEventListener("click", async () => {
             if (images.length === 0) {
                 alert("Upload images first");
@@ -203,14 +205,12 @@
 
             const exportBtn = document.getElementById("export");
             exportBtn.disabled = true;
+            status.textContent = "Preparing GIF worker...";
 
             const fps = parseFloat(fpsInput.value) || 1;
             const delay = 1000 / fps;
 
-            status.textContent = "Preparing GIF worker...";
-
             try {
-                // Fetch the worker to bypass cross-origin worker restrictions when opening locally
                 let workerScriptUrl = "gif.worker.js";
                 try {
                     const response = await fetch("https://cdn.jsdelivr.net/npm/gif.js.optimized/dist/gif.worker.js");
@@ -220,22 +220,19 @@
                         workerScriptUrl = URL.createObjectURL(blob);
                     }
                 } catch (e) {
-                    console.warn("Could not fetch worker from CDN, falling back to local file", e);
+                    console.warn("Falling back to local worker file", e);
                 }
 
-                status.textContent = "Rendering GIF... 0%";
+                status.textContent = "Rendering Maximum Quality GIF... 0%";
 
                 const gif = new GIF({
-                    // Use hardware concurrency to speed up rendering with available CPU cores
                     workers: navigator.hardwareConcurrency || 2,
-                    quality: 1,
+                    quality: 1, // MAXIMUM QUALITY (1 is best, 10 is default)
+                    dither: "FloydSteinberg-serpentine", // Smoothes out the 256-color limit
                     workerScript: workerScriptUrl
                 });
 
-                // Get images in their current visual order from the preview container
                 const currentImages = Array.from(preview.children);
-
-                // Use the first image's full original resolution to keep highest quality
                 let width = currentImages[0].naturalWidth || currentImages[0].width;
                 let height = currentImages[0].naturalHeight || currentImages[0].height;
 
@@ -244,11 +241,8 @@
                     canvas.width = width;
                     canvas.height = height;
                     const ctx = canvas.getContext("2d");
-
-                    // Fill background just in case there are transparent images
                     ctx.fillStyle = "white";
                     ctx.fillRect(0, 0, width, height);
-
                     ctx.drawImage(img, 0, 0, width, height);
                     gif.addFrame(canvas, { delay, copy: true });
                 });
@@ -258,13 +252,11 @@
                 });
 
                 gif.on("finished", blob => {
-                    const url = URL.createObjectURL(blob);
                     const a = document.createElement("a");
-                    a.href = url;
-                    a.download = "animation.gif";
+                    a.href = URL.createObjectURL(blob);
+                    a.download = "animation_max_quality.gif";
                     a.click();
-
-                    status.textContent = "Done!";
+                    status.textContent = "GIF Done!";
                     exportBtn.disabled = false;
                 });
 
@@ -276,82 +268,143 @@
             }
         });
 
-        // EXPORT VIDEO (WebM via native MediaRecorder)
+        // --- 2. VIRTUALLY LOSSLESS MP4 VIDEO EXPORT (WebCodecs) ---
         document.getElementById("export-video").addEventListener("click", async () => {
             if (images.length === 0) {
                 alert("Upload images first");
                 return;
             }
+            if (typeof VideoEncoder === "undefined") {
+                alert("Your browser does not support WebCodecs. Please use a modern version of Chrome or Edge.");
+                return;
+            }
 
             const exportBtn = document.getElementById("export-video");
             exportBtn.disabled = true;
+            status.textContent = "Encoding pristine MP4 video...";
 
             const fps = parseFloat(fpsInput.value) || 1;
             const currentImages = Array.from(preview.children);
 
-            status.textContent = "Recording video... (This process takes real-time)";
-
             try {
-                // Use the first image's full original resolution
-                let width = currentImages[0].naturalWidth || currentImages[0].width;
-                let height = currentImages[0].naturalHeight || currentImages[0].height;
+                // Get original resolution
+                let rawWidth = currentImages[0].naturalWidth || currentImages[0].width;
+                let rawHeight = currentImages[0].naturalHeight || currentImages[0].height;
+
+                // H.264 Video Encoders require dimensions to be EVEN numbers
+                let width = rawWidth % 2 === 0 ? rawWidth : rawWidth + 1;
+                let height = rawHeight % 2 === 0 ? rawHeight : rawHeight + 1;
+
+                // Find a supported resolution by scaling down if necessary, as many hardware encoders fail on 12MP+.
+                let scale = 1.0;
+                let finalCodecString = 'avc1.640028';
+                let supported = false;
+
+                while (scale >= 0.1) {
+                    let testWidth = Math.floor((width * scale) / 2) * 2;
+                    let testHeight = Math.floor((height * scale) / 2) * 2;
+
+                    const mbs = Math.ceil(testWidth / 16) * Math.ceil(testHeight / 16);
+                    let codecString = 'avc1.640028';
+                    if (mbs > 8192) codecString = 'avc1.640032';
+                    if (mbs > 22080) codecString = 'avc1.640034';
+                    if (mbs > 36864) codecString = 'avc1.64003E';
+
+                    const config = {
+                        codec: codecString,
+                        width: testWidth,
+                        height: testHeight,
+                        bitrate: 50_000_000,
+                        framerate: fps
+                    };
+
+                    const support = await VideoEncoder.isConfigSupported(config);
+                    if (support.supported) {
+                        width = testWidth;
+                        height = testHeight;
+                        finalCodecString = codecString;
+                        supported = true;
+                        break;
+                    }
+                    scale -= 0.05; // Drop by 5% and test again
+                }
+
+                if (!supported) {
+                    throw new Error("Unable to find a supported video configuration for your browser. Try smaller images.");
+                }
+
+                if (scale < 1.0) {
+                    status.textContent = `Scaling down to ${width}x${height} to support H.264 limits...`;
+                }
+
+                // Setup the MP4 Muxer
+                let muxer = new Mp4Muxer.Muxer({
+                    target: new Mp4Muxer.ArrayBufferTarget(),
+                    video: {
+                        codec: 'avc',
+                        width: width,
+                        height: height
+                    },
+                    fastStart: 'in-memory'
+                });
+
+                // Setup the WebCodecs Video Encoder
+                let videoEncoder = new VideoEncoder({
+                    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+                    error: e => console.error(e)
+                });
+
+                videoEncoder.configure({
+                    codec: finalCodecString,
+                    width: width,
+                    height: height,
+                    bitrate: 50_000_000, // Massive 50 Mbps bitrate for visually lossless quality
+                    framerate: fps
+                });
 
                 const canvas = document.createElement("canvas");
                 canvas.width = width;
                 canvas.height = height;
-                const ctx = canvas.getContext("2d");
+                const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
-                // Capture canvas at a standard framerate
-                const stream = canvas.captureStream(30);
-
-                // Fallback from vp9 to vp8 if not supported
-                let mimeType = 'video/webm; codecs=vp9';
-                if (!MediaRecorder.isTypeSupported(mimeType)) {
-                    mimeType = 'video/webm';
-                }
-
-                // Request a very high bitrate (25 Mbps) so it preserves the original quality
-                const mediaRecorder = new MediaRecorder(stream, {
-                    mimeType,
-                    videoBitsPerSecond: 25000000
-                });
-
-                const chunks = [];
-                mediaRecorder.ondataavailable = e => chunks.push(e.data);
-                mediaRecorder.onstop = () => {
-                    const blob = new Blob(chunks, { type: mimeType });
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement("a");
-                    a.href = url;
-                    a.download = "animation.webm";
-                    a.click();
-
-                    status.textContent = "Video export complete!";
-                    exportBtn.disabled = false;
-                };
-
-                mediaRecorder.start();
-
-                // Draw frames with real-time delay so MediaRecorder captures the correct pacing
-                const delayMs = 1000 / fps;
+                // Encode frame by frame
                 for (let i = 0; i < currentImages.length; i++) {
+                    status.textContent = `Encoding high-res frame ${i + 1} of ${currentImages.length}...`;
+
                     ctx.fillStyle = "black";
                     ctx.fillRect(0, 0, width, height);
-                    ctx.drawImage(currentImages[i], 0, 0, width, height);
+                    ctx.drawImage(currentImages[i], 0, 0, rawWidth, rawHeight);
 
-                    status.textContent = `Recording frame ${i + 1} of ${currentImages.length}...`;
+                    // Calculate precise timestamps (in microseconds)
+                    let timestamp_us = (i * 1000000) / fps;
+                    let duration_us = 1000000 / fps;
 
-                    // Wait for the duration of one frame
-                    await new Promise(resolve => setTimeout(resolve, delayMs));
+                    let frame = new VideoFrame(canvas, { timestamp: timestamp_us, duration: duration_us });
+
+                    // Force a keyframe every second (or on the first frame if fps is less than 1)
+                    let isKeyFrame = i % Math.max(1, Math.floor(fps)) === 0;
+                    videoEncoder.encode(frame, { keyFrame: isKeyFrame });
+                    frame.close();
                 }
 
-                // Give MediaRecorder a tiny bit of extra time to capture the final frame
-                await new Promise(resolve => setTimeout(resolve, 50));
+                status.textContent = "Finalizing video file...";
+                await videoEncoder.flush();
+                muxer.finalize();
 
-                mediaRecorder.stop();
+                // Download the file
+                let buffer = muxer.target.buffer;
+                let blob = new Blob([buffer], { type: 'video/mp4' });
+                const a = document.createElement("a");
+                a.href = URL.createObjectURL(blob);
+                a.download = "animation_lossless.mp4";
+                a.click();
+
+                status.textContent = "Video export complete!";
+                exportBtn.disabled = false;
+
             } catch (error) {
                 console.error(error);
-                status.textContent = "Error rendering Video!";
+                status.textContent = "Error encoding Video!";
                 exportBtn.disabled = false;
             }
         });
